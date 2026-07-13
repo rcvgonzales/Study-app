@@ -136,3 +136,4 @@ study-forge/
         ├── main.jsx
         └── App.jsx       # entire app (single component file)
 ```
+# Study-app
