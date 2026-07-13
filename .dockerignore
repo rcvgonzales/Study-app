@@ -1,0 +1,11 @@
+# A local node_modules would be copied over the container's freshly installed one by
+# `COPY frontend/ ./`, silently shipping host-built binaries into the image.
+node_modules
+**/node_modules
+dist
+**/dist
+__pycache__
+**/__pycache__
+*.pyc
+.git
+.env
