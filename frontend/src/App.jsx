@@ -62,10 +62,6 @@ async function saveDecks(data) {
   } catch (e) { console.error("save failed", e); }
 }
 
-/* Quota exhaustion is not a transient failure — retrying it just burns time and
-   more quota. Tagged so callers can bail out instead of grinding. */
-class QuotaError extends Error {}
-
 /* ── Claude API (instrumented: errors carry status + raw body so failures are diagnosable) ── */
 async function callClaude(prompt, maxRetries = 1) {
   let lastErr = null;
@@ -74,25 +70,19 @@ async function callClaude(prompt, maxRetries = 1) {
       const res = await fetch("/api/claude", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, max_tokens: 4000 }),
+        body: JSON.stringify({ prompt, max_tokens: 1500 }),
       });
       const rawBody = await res.text();
-      let data = null;
-      try { data = JSON.parse(rawBody); } catch { /* non-JSON body handled below */ }
-      const detail = data && data.detail ? String(data.detail) : "";
-
-      // The backend already walked its whole model fallback chain before it gave up,
-      // so a 429 here means every model is spent. Sleeping cannot fix that — a daily
-      // cap doesn't clear for hours. Surface the backend's explanation verbatim.
-      if (res.status === 429) throw new QuotaError(detail || "Rate limited by Gemini.");
-      if (!res.ok) throw new Error(detail || `API HTTP ${res.status}: ${rawBody.slice(0, 160)}`);
-      if (!data) throw new Error(`Proxy returned non-JSON (${res.status}): ${rawBody.slice(0, 160)}`);
-      if (detail) throw new Error(detail.slice(0, 200));
+      if (!res.ok) throw new Error(`API HTTP ${res.status}: ${rawBody.slice(0, 160)}`);
+      let data;
+      try { data = JSON.parse(rawBody); }
+      catch { throw new Error(`Proxy returned non-JSON (${res.status}): ${rawBody.slice(0, 160)}`); }
+      if (data.detail) throw new Error(`Proxy error: ${String(data.detail).slice(0, 160)}`);
       if (data.text) return data.text;
       throw new Error(`Proxy gave empty text. Body: ${rawBody.slice(0, 160)}`);
     } catch (e) {
       lastErr = e;
-      if (e instanceof QuotaError || i === maxRetries) throw e;
+      if (i === maxRetries) throw e;
     }
   }
   throw lastErr || new Error("No response");
@@ -114,6 +104,22 @@ function extractJsonArray(text) {
   return JSON.parse(clean.slice(start, end + 1));
 }
 
+function extractJsonObject(text) {
+  const clean = text.replace(/```json|```/g, "").trim();
+  const start = clean.indexOf("{");
+  const end = clean.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) throw new Error(`Grader replied with text: "${clean.slice(0, 120)}"`);
+  return JSON.parse(clean.slice(start, end + 1));
+}
+
+async function gradeAnswer(question, correctAnswer, userAnswer) {
+  const prompt = `You are grading one flashcard quiz answer.\nQuestion: "${question}"\nCorrect answer: "${correctAnswer}"\nStudent's answer: "${userAnswer}"\n\nGrade generously on substance: accept paraphrases, partial wording, and different phrasing that captures the key idea. Grade "incorrect" only if the core concept is wrong or missing.\n\nRespond with ONLY raw JSON, no fences, no preamble:\n{"verdict":"correct" or "incorrect","feedback":"one short sentence explaining why"}`;
+  const text = await callClaude(prompt);
+  const parsed = extractJsonObject(text);
+  if (parsed.verdict !== "correct" && parsed.verdict !== "incorrect") throw new Error("Bad verdict");
+  return { verdict: parsed.verdict, feedback: String(parsed.feedback || "") };
+}
+
 async function generateCardBatch(notes, count, avoidFronts) {
   const avoid = avoidFronts.length
     ? `\n\nDo NOT duplicate these existing questions:\n${avoidFronts.map((f) => "- " + f).join("\n")}`
@@ -125,48 +131,33 @@ async function generateCardBatch(notes, count, avoidFronts) {
   return parsed.filter((c) => c.front && c.back);
 }
 
-/* Returns { cards, shortfall } — shortfall is the reason we came up short, or null.
-   The caller needs the reason: "the model returned junk" and "you are out of quota"
-   deserve very different messages. */
 async function generateCards(notes, count, existingFronts = []) {
-  // One request covers the largest deck the UI offers. Batches of 5 were a workaround
-  // for a token cap that thinking tokens were quietly eating; with thinking disabled,
-  // 20 cards fit comfortably in a single call. Fewer calls matters a lot on the free
-  // tier, where the daily request quota — not tokens — is the binding constraint.
-  const BATCH = 20;
+  // Batches of 5 keep each response comfortably inside the token limit
+  const BATCH = 5;
   const collected = [];
   const avoid = [...existingFronts];
-  // Consecutive, not cumulative: one flaky batch shouldn't doom a 20-card run
-  // that is otherwise going fine.
-  let misses = 0;
-  let lastErr = null;
-  while (collected.length < count && misses < 2) {
+  let failures = 0;
+  while (collected.length < count && failures < 2) {
     const need = Math.min(BATCH, count - collected.length);
     try {
       const batch = await generateCardBatch(notes, need, avoid.slice(-40));
-      // An empty batch makes no progress; without this it spins forever.
-      if (batch.length === 0) throw new Error("Batch returned no usable cards");
-      misses = 0;
       for (const c of batch) {
         collected.push(c);
         avoid.push(c.front);
       }
     } catch (e) {
-      if (e instanceof QuotaError) throw e; // more attempts cannot help
-      lastErr = e;
-      misses += 1;
-      if (collected.length === 0 && misses >= 2) throw e;
+      failures += 1;
+      if (collected.length === 0 && failures >= 2) throw e;
     }
   }
   if (collected.length === 0) throw new Error("Generation produced no cards");
-  const cards = collected.slice(0, count).map((c, i) =>
+  return collected.slice(0, count).map((c, i) =>
     normalizeCard({
       id: Date.now() + "-" + i + "-" + Math.random().toString(36).slice(2, 6),
       front: String(c.front),
       back: String(c.back),
     })
   );
-  return { cards, shortfall: cards.length < count && lastErr ? lastErr.message : null };
 }
 
 /* ── shared styles ── */
@@ -241,12 +232,11 @@ function Header({ onHome, sub }) {
 }
 
 /* ── HOME ── */
-function Home({ data, onNew, onOpen, onDelete, onDeleteSession, onClearSessions }) {
+function Home({ data, onNew, onOpen, onDelete }) {
   const [confirmId, setConfirmId] = useState(null);
-  const [confirmClear, setConfirmClear] = useState(false);
   const totalCards = data.decks.reduce((a, d) => a + d.cards.length, 0);
   const totalDue = data.decks.reduce((a, d) => a + d.cards.filter(isDue).length, 0);
-  const totalReviews = data.sessions.reduce((a, s) => a + s.reviewed, 0);
+  const totalReviews = data.sessions.reduce((a, s) => a + (s.reviewed || s.total || 0), 0);
   return (
     <div>
       <div style={{ display: "flex", gap: 24, marginBottom: 24, flexWrap: "wrap" }}>
@@ -270,6 +260,8 @@ function Home({ data, onNew, onOpen, onDelete, onDeleteSession, onClearSessions 
         {data.decks.map((d) => {
           const due = d.cards.filter(isDue).length;
           const mastered = d.cards.filter((c) => c.streak >= 3).length;
+          const deckQuizzes = data.sessions.filter((s) => s.quiz && (s.deckId === d.id || (!s.deckId && s.deckTitle === d.title)));
+          const lastQuiz = deckQuizzes.length ? deckQuizzes[deckQuizzes.length - 1] : null;
           return (
             <div key={d.id} style={{ ...S.panel, marginBottom: 12, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
               <div style={{ cursor: "pointer", flex: 1, minWidth: 200 }} onClick={() => onOpen(d.id)}>
@@ -282,7 +274,12 @@ function Home({ data, onNew, onOpen, onDelete, onDeleteSession, onClearSessions 
                   )}
                 </div>
                 <div style={{ ...S.mono, fontSize: 11, color: C.inkSoft, marginTop: 4 }}>
-                  {d.cards.length} cards · {mastered} mastered · {new Date(d.created).toLocaleDateString()}
+                  {d.cards.length} cards · {mastered} mastered ·{" "}
+                  {lastQuiz
+                    ? <span style={{ color: Math.round((lastQuiz.score / lastQuiz.total) * 100) >= 70 ? C.jadeDeep : C.danger, fontWeight: 600 }}>
+                        quiz {lastQuiz.score}/{lastQuiz.total}
+                      </span>
+                    : <span style={{ color: C.brass }}>no quiz yet</span>}
                 </div>
               </div>
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -311,76 +308,41 @@ function Home({ data, onNew, onOpen, onDelete, onDeleteSession, onClearSessions 
         })}
       </div>
 
-      {data.sessions.length > 0 && (() => {
-        // Split the ledger by type. A row's position in these filtered lists is NOT its
-        // index in data.sessions — deleting by that would remove the wrong entry, so each
-        // row carries its real index (i) for onDeleteSession.
-        const withIdx = data.sessions.map((s, i) => ({ s, i }));
-        const studyAll = withIdx.filter(({ s }) => !s.quiz);
-        const quizAll = withIdx.filter(({ s }) => s.quiz);
-
-        // One labeled sub-section, newest first. Hidden entirely when empty. renderMeta
-        // draws the type-specific right-hand cell; the row chrome + delete stays shared.
-        const section = (title, all, renderMeta) => {
-          if (all.length === 0) return null;
-          const rows = all.slice(-6).reverse();
-          return (
-            <div style={{ marginTop: 18 }}>
-              <div style={{ ...S.label, marginBottom: 8 }}>{title}</div>
-              <div style={{ ...S.panel, padding: 0, overflow: "hidden" }}>
-                {rows.map(({ s, i }, n) => (
-                  <div key={i} style={{ ...S.mono, fontSize: 12, padding: "10px 16px", borderBottom: n < rows.length - 1 ? `1px solid ${C.line}` : "none", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                    <span>{new Date(s.date).toLocaleDateString()} · {s.deckTitle}</span>
-                    <span style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                      {renderMeta(s)}
-                      <button
-                        aria-label={`Remove ${s.deckTitle} entry`}
-                        title="Remove this entry"
-                        onClick={() => onDeleteSession(i)}
-                        style={{ ...S.mono, fontSize: 15, lineHeight: 1, color: C.inkSoft, background: "none", border: "none", cursor: "pointer", padding: "2px 4px" }}
-                      >
-                        ×
-                      </button>
-                    </span>
-                  </div>
-                ))}
-              </div>
-              {all.length > rows.length && (
-                <div style={{ ...S.mono, fontSize: 11, color: C.inkSoft, marginTop: 6 }}>
-                  showing the {rows.length} most recent of {all.length}
-                </div>
-              )}
-            </div>
-          );
-        };
-
+      {(() => {
+        const studySessions = data.sessions.filter((s) => !s.quiz).slice(-6).reverse();
+        const quizSessions = data.sessions.filter((s) => s.quiz).slice(-6).reverse();
+        if (!studySessions.length && !quizSessions.length) return null;
         return (
           <div style={{ marginTop: 32 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
-              <div style={S.label}>Session ledger</div>
-              {confirmClear ? (
-                <span style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                  <span style={{ ...S.mono, fontSize: 11, color: C.danger }}>
-                    Clear all {data.sessions.length} entr{data.sessions.length === 1 ? "y" : "ies"}?
-                  </span>
-                  <button style={{ ...S.btn("danger"), background: C.danger, color: "#fff" }} onClick={() => { onClearSessions(); setConfirmClear(false); }}>
-                    Yes, clear
-                  </button>
-                  <button style={S.btn("ghost")} onClick={() => setConfirmClear(false)}>Cancel</button>
-                </span>
-              ) : (
-                <button style={S.btn("ghost")} onClick={() => setConfirmClear(true)}>Clear ledger</button>
-              )}
-            </div>
-            {section("Reviewed", studyAll, (s) => (
-              <span style={{ color: C.jadeDeep }}>{s.reviewed} reviews · {s.cleared} cleared</span>
-            ))}
-            {section("Quiz results", quizAll, (s) => {
-              const percent = s.total ? Math.round((s.score / s.total) * 100) : 0;
-              return (
-                <span style={{ color: percent >= 70 ? C.jadeDeep : C.danger }}>{s.score}/{s.total} · {percent}%</span>
-              );
-            })}
+            {studySessions.length > 0 && (
+              <div style={{ marginBottom: 22 }}>
+                <div style={{ ...S.label, marginBottom: 10 }}>Reviewed</div>
+                <div style={{ ...S.panel, padding: 0, overflow: "hidden" }}>
+                  {studySessions.map((s, i) => (
+                    <div key={i} style={{ ...S.mono, fontSize: 12, padding: "10px 16px", borderBottom: i < studySessions.length - 1 ? `1px solid ${C.line}` : "none", display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                      <span>{new Date(s.date).toLocaleDateString()} · {s.deckTitle}</span>
+                      <span style={{ color: C.jadeDeep }}>{s.reviewed} reviews · {s.cleared} cleared</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {quizSessions.length > 0 && (
+              <div>
+                <div style={{ ...S.label, marginBottom: 10 }}>Quiz results</div>
+                <div style={{ ...S.panel, padding: 0, overflow: "hidden" }}>
+                  {quizSessions.map((s, i) => {
+                    const p = Math.round((s.score / s.total) * 100);
+                    return (
+                      <div key={i} style={{ ...S.mono, fontSize: 12, padding: "10px 16px", borderBottom: i < quizSessions.length - 1 ? `1px solid ${C.line}` : "none", display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                        <span>{new Date(s.date).toLocaleDateString()} · {s.deckTitle}</span>
+                        <span style={{ color: p >= 70 ? C.jadeDeep : C.danger, fontWeight: 600 }}>{s.score}/{s.total} · {p}%</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         );
       })()}
@@ -439,15 +401,8 @@ function Create({ onSave, onCancel }) {
   };
   const doCards = async () => {
     setErr(""); setBusy("cards");
-    try {
-      const { cards: made, shortfall } = await generateCards(notes, count);
-      setCards(made);
-      if (shortfall) {
-        setErr(`Only got ${made.length} of ${count} cards (${shortfall}). The cards below are good — generate again to top up.`);
-      }
-    } catch (e) {
-      setErr(e instanceof QuotaError ? e.message : `Card generation failed: ${e.message || e}. Try again or use fewer cards.`);
-    }
+    try { setCards(await generateCards(notes, count)); }
+    catch (e) { setErr(`Card generation failed: ${e.message || e}. Try again or use fewer cards.`); }
     setBusy("");
   };
 
@@ -558,49 +513,17 @@ function Create({ onSave, onCancel }) {
 }
 
 /* ── STUDY (v3: swipe deck — tap to flip, swipe up = got it, swipe down = again) ── */
-/* Card scheduling saves either way; this only controls the ledger row + Reviews stat. */
-function LedgerToggle({ record, onChange }) {
-  return (
-    <label
-      style={{
-        ...S.mono, fontSize: 12, marginTop: 16, display: "inline-flex", alignItems: "center",
-        gap: 8, cursor: "pointer", color: record ? C.ink : C.inkSoft,
-      }}
-    >
-      <input
-        type="checkbox"
-        checked={record}
-        onChange={(e) => onChange(e.target.checked)}
-        style={{ width: 15, height: 15, accentColor: C.jade, cursor: "pointer" }}
-      />
-      Record this session in the ledger
-      <span style={{ color: C.inkSoft }}>· card progress saves either way</span>
-    </label>
-  );
-}
-
-function Study({ deck, onFinish, onExit, onRestart }) {
+function Study({ deck, onFinish, onExit }) {
   const [queue, setQueue] = useState(() => {
     const due = deck.cards.filter(isDue);
     const pool = due.length ? due : [...deck.cards];
     return pool.sort((a, b) => a.streak - b.streak || Math.random() - 0.5).map((c) => c.id);
   });
-  // Cards answered "again" go into the NEXT round rather than being spliced back a
-  // few places ahead. Splicing let missed cards cut in front of cards not yet seen,
-  // so a run of wrong answers pushed the tail of the deck back indefinitely — you
-  // could cycle the same handful forever and never reach the rest, and the session
-  // could never end. Rounds guarantee every card is seen once before any repeats.
-  const [retry, setRetry] = useState([]);
-  const [round, setRound] = useState(1);
   const [idx, setIdx] = useState(0);
   const [flipped, setFlipped] = useState(false);
   const [missed, setMissed] = useState({});
   const [cleared, setCleared] = useState({});
   const [reviews, setReviews] = useState(0);
-  // Card scheduling always saves — that's the spaced-repetition engine. The ledger row
-  // is a separate, optional record of the sitting, so a quick re-skim doesn't have to
-  // pad the history or inflate the Reviews stat.
-  const [record, setRecord] = useState(true);
 
   // swipe state
   const [dragY, setDragY] = useState(0);
@@ -609,24 +532,18 @@ function Study({ deck, onFinish, onExit, onRestart }) {
 
   const cardId = queue[idx];
   const card = deck.cards.find((c) => c.id === cardId);
-  const roundOver = idx >= queue.length;
-  const done = roundOver && retry.length === 0;
+  const done = idx >= queue.length;
   const SWIPE_THRESHOLD = 90;
-  const progressPayload = { missed, cleared, reviews, record };
-
-  const startNextRound = () => {
-    setQueue(retry);
-    setRetry([]);
-    setIdx(0);
-    setRound((r) => r + 1);
-    setFlipped(false);
-  };
 
   const answer = (r) => {
     setReviews((n) => n + 1);
     if (r === "again") {
       setMissed((m) => ({ ...m, [cardId]: true }));
-      setRetry((q) => [...q, cardId]);
+      setQueue((q) => {
+        const next = [...q];
+        next.splice(Math.min(idx + 4, next.length), 0, cardId);
+        return next;
+      });
     } else {
       setCleared((c2) => ({ ...c2, [cardId]: true }));
     }
@@ -662,43 +579,6 @@ function Study({ deck, onFinish, onExit, onRestart }) {
     setStartY(null);
   };
 
-  // An empty deck would otherwise satisfy `done` on the first render and write a
-  // zero-review row into the session ledger.
-  if (!queue.length && round === 1 && !reviews) {
-    return (
-      <div style={{ textAlign: "center", paddingTop: 40 }}>
-        <div style={{ ...S.display, fontSize: 22, fontWeight: 700 }}>This deck has no cards</div>
-        <div style={{ ...S.mono, fontSize: 13, color: C.inkSoft, marginTop: 8 }}>
-          Add some in the deck editor first.
-        </div>
-        <button style={{ ...S.btn("primary"), marginTop: 24 }} onClick={() => onExit(null)}>
-          Back to deck
-        </button>
-      </div>
-    );
-  }
-
-  // Round finished, but some cards were answered "again" — they come back now.
-  if (roundOver && retry.length > 0) {
-    return (
-      <div style={{ textAlign: "center", paddingTop: 24 }}>
-        <div style={{ ...S.display, fontSize: 28, fontWeight: 800 }}>Round {round} done</div>
-        <div style={{ ...S.mono, fontSize: 13, color: C.inkSoft, marginTop: 8 }}>
-          {retry.length} card{retry.length === 1 ? "" : "s"} you missed{retry.length === 1 ? " comes" : " come"} back now
-        </div>
-        <button style={{ ...S.btn("primary"), marginTop: 24 }} onClick={startNextRound}>
-          Retry {retry.length} card{retry.length === 1 ? "" : "s"}
-        </button>
-        <LedgerToggle record={record} onChange={setRecord} />
-        <div>
-          <button style={{ ...S.btn("ghost"), marginTop: 6 }} onClick={() => onExit(progressPayload)}>
-            Stop here
-          </button>
-        </div>
-      </div>
-    );
-  }
-
   if (done) {
     const clearedCount = Object.keys(cleared).length;
     const missedCount = Object.keys(missed).length;
@@ -709,23 +589,18 @@ function Study({ deck, onFinish, onExit, onRestart }) {
         <div style={{ ...S.mono, fontSize: 13, color: C.inkSoft, marginTop: 8 }}>
           {clearedCount} cards cleared · {reviews} total reviews
         </div>
-        <div style={{ ...S.panel, marginTop: 24, textAlign: "left", borderLeft: `4px solid ${record ? C.jade : C.line}`, opacity: record ? 1 : 0.55, transition: "opacity 0.15s" }}>
+        <div style={{ ...S.panel, marginTop: 24, textAlign: "left", borderLeft: `4px solid ${C.jade}` }}>
           <div style={{ ...S.label, marginBottom: 8 }}>Evidence log entry</div>
           <div style={{ ...S.mono, fontSize: 12, lineHeight: 1.6 }}>{logLine}</div>
           <button style={{ ...S.btn("ghost"), marginTop: 12 }} onClick={() => navigator.clipboard && navigator.clipboard.writeText(logLine)}>
             Copy for evidence log
           </button>
         </div>
-
-        <LedgerToggle record={record} onChange={setRecord} />
-
-        <div style={{ display: "flex", gap: 12, marginTop: 18, justifyContent: "center", flexWrap: "wrap" }}>
-          <button style={{ ...S.btn("primary"), flex: 1, maxWidth: 220 }} onClick={() => onFinish(progressPayload)}>
-            Save &amp; finish
-          </button>
-          <button style={{ ...S.btn("brass"), flex: 1, maxWidth: 220 }} onClick={() => onRestart(progressPayload)}>
-            Study this deck again
-          </button>
+        <button style={{ ...S.btn("primary"), marginTop: 24 }} onClick={() => onFinish({ missed, cleared, reviews })}>
+          Save session
+        </button>
+        <div style={{ ...S.mono, fontSize: 11, color: C.inkSoft, marginTop: 14 }}>
+          Once every card has been studied, Quiz mode unlocks in the deck view — typed answers, no retries.
         </div>
       </div>
     );
@@ -742,13 +617,10 @@ function Study({ deck, onFinish, onExit, onRestart }) {
     <div style={{ touchAction: "pan-x", userSelect: "none" }}>
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14 }}>
         <span style={{ ...S.mono, fontSize: 12, color: C.inkSoft }}>
-          {remaining} left{round > 1 ? ` · round ${round}` : ""}
-          {/* retry.length is what's actually still pending, so this counts down as you
-              clear cards. The old counter read from `missed`, which is never unset. */}
-          {retry.length > 0 ? ` · ${retry.length} to retry` : ""}
+          {remaining} card{remaining === 1 ? "" : "s"} left{Object.keys(missed).length > 0 ? ` · ${Object.keys(missed).length} recycling` : ""}
         </span>
-        <button style={{ ...S.mono, fontSize: 12, color: C.inkSoft, background: "none", border: "none", cursor: "pointer" }} onClick={() => onExit(progressPayload)}>
-          save &amp; exit
+        <button style={{ ...S.mono, fontSize: 12, color: C.inkSoft, background: "none", border: "none", cursor: "pointer" }} onClick={onExit}>
+          exit
         </button>
       </div>
 
@@ -813,8 +685,147 @@ function Study({ deck, onFinish, onExit, onRestart }) {
   );
 }
 
+/* ── QUIZ (typed recall, one attempt per question, no retries) ── */
+function Quiz({ deck, onFinish, onExit }) {
+  const [questions] = useState(() => {
+    const pool = [...deck.cards].sort(() => Math.random() - 0.5);
+    return pool.slice(0, Math.min(10, pool.length));
+  });
+  const [idx, setIdx] = useState(0);
+  const [answer, setAnswer] = useState("");
+  const [phase, setPhase] = useState("answer"); // answer | grading | feedback | selfgrade
+  const [result, setResult] = useState(null);
+  const [results, setResults] = useState([]);
+
+  const q = questions[idx];
+  const done = idx >= questions.length;
+
+  const submit = async () => {
+    if (!answer.trim()) return;
+    setPhase("grading");
+    try {
+      const r = await gradeAnswer(q.front, q.back, answer.trim());
+      setResult(r);
+      setPhase("feedback");
+    } catch {
+      setPhase("selfgrade"); // AI unavailable: reveal answer, self-grade honestly
+    }
+  };
+
+  const record = (verdict, feedback) => {
+    setResults([...results, { front: q.front, back: q.back, answer: answer.trim(), verdict, feedback }]);
+    setAnswer("");
+    setResult(null);
+    setPhase("answer");
+    setIdx(idx + 1);
+  };
+
+  if (done) {
+    const score = results.filter((r) => r.verdict === "correct").length;
+    const logLine = `${new Date().toISOString().slice(0, 10)} — Quiz "${deck.title}": ${score}/${results.length} correct (typed recall)`;
+    return (
+      <div>
+        <div style={{ textAlign: "center", paddingTop: 12 }}>
+          <div style={{ ...S.display, fontSize: 30, fontWeight: 800 }}>Quiz done</div>
+          <div style={{ ...S.display, fontSize: 44, fontWeight: 800, color: score / results.length >= 0.7 ? C.jadeDeep : C.brass, marginTop: 6 }}>
+            {score}/{results.length}
+          </div>
+        </div>
+        <div style={{ ...S.panel, marginTop: 20, borderLeft: `4px solid ${C.jade}` }}>
+          <div style={{ ...S.label, marginBottom: 8 }}>Evidence log entry</div>
+          <div style={{ ...S.mono, fontSize: 12, lineHeight: 1.6 }}>{logLine}</div>
+          <button style={{ ...S.btn("ghost"), marginTop: 12 }} onClick={() => navigator.clipboard && navigator.clipboard.writeText(logLine)}>
+            Copy for evidence log
+          </button>
+        </div>
+        <div style={{ marginTop: 20 }}>
+          <div style={{ ...S.label, marginBottom: 10 }}>Review</div>
+          {results.map((r, i) => (
+            <div key={i} style={{ ...S.panel, marginBottom: 8, padding: 14, borderLeft: `4px solid ${r.verdict === "correct" ? C.jadeDeep : C.danger}` }}>
+              <div style={{ fontWeight: 600, fontSize: 14 }}>{r.front}</div>
+              <div style={{ ...S.mono, fontSize: 11, color: C.inkSoft, marginTop: 6 }}>you: {r.answer || "(blank)"}</div>
+              <div style={{ fontSize: 13, color: C.inkSoft, marginTop: 4 }}>answer: {r.back}</div>
+              {r.feedback && <div style={{ fontSize: 12, color: r.verdict === "correct" ? C.jadeDeep : C.danger, marginTop: 4 }}>{r.feedback}</div>}
+            </div>
+          ))}
+        </div>
+        <button style={{ ...S.btn("primary"), marginTop: 16 }} onClick={() => onFinish(results)}>Save quiz</button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14 }}>
+        <span style={{ ...S.mono, fontSize: 12, color: C.inkSoft }}>Question {idx + 1} / {questions.length} · no retries</span>
+        <button style={{ ...S.mono, fontSize: 12, color: C.inkSoft, background: "none", border: "none", cursor: "pointer" }} onClick={onExit}>exit</button>
+      </div>
+      <div style={{ height: 4, background: C.line, borderRadius: 2, marginBottom: 20 }}>
+        <div style={{ height: 4, width: `${(idx / questions.length) * 100}%`, background: C.brass, borderRadius: 2, transition: "width 0.2s" }} />
+      </div>
+
+      <div style={{ ...S.panel, borderTop: `4px solid ${C.brass}` }}>
+        <div style={{ ...S.label, marginBottom: 10 }}>Recall — type your answer</div>
+        <div style={{ ...S.display, fontSize: 18, fontWeight: 600, lineHeight: 1.4 }}>{q.front}</div>
+      </div>
+
+      {phase === "answer" || phase === "grading" ? (
+        <>
+          <textarea
+            value={answer}
+            onChange={(e) => setAnswer(e.target.value)}
+            placeholder="Type your answer from memory…"
+            rows={4}
+            disabled={phase === "grading"}
+            style={{ width: "100%", boxSizing: "border-box", padding: 14, fontSize: 15, lineHeight: 1.5, fontFamily: "'Figtree', sans-serif", border: `1.5px solid ${C.line}`, borderRadius: 8, background: C.card, color: C.ink, marginTop: 14, resize: "vertical" }}
+          />
+          <button
+            style={{ ...S.btn("primary"), marginTop: 12, opacity: answer.trim() && phase !== "grading" ? 1 : 0.5 }}
+            disabled={!answer.trim() || phase === "grading"}
+            onClick={submit}
+          >
+            {phase === "grading" ? "Grading…" : "Submit — final answer"}
+          </button>
+        </>
+      ) : phase === "feedback" ? (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ ...S.panel, borderLeft: `4px solid ${result.verdict === "correct" ? C.jadeDeep : C.danger}` }}>
+            <div style={{ ...S.label, color: result.verdict === "correct" ? C.jadeDeep : C.danger, marginBottom: 8 }}>
+              {result.verdict === "correct" ? "Correct" : "Incorrect"}
+            </div>
+            <div style={{ fontSize: 13, color: C.inkSoft }}>{result.feedback}</div>
+            <div style={{ fontSize: 13, marginTop: 8 }}><b>Answer:</b> {q.back}</div>
+          </div>
+          <button style={{ ...S.btn("primary"), marginTop: 12 }} onClick={() => record(result.verdict, result.feedback)}>
+            Next
+          </button>
+        </div>
+      ) : (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ ...S.panel, borderLeft: `4px solid ${C.brass}` }}>
+            <div style={{ ...S.label, marginBottom: 8 }}>AI grading unavailable — grade yourself honestly</div>
+            <div style={{ fontSize: 13 }}><b>Correct answer:</b> {q.back}</div>
+            <div style={{ ...S.mono, fontSize: 11, color: C.inkSoft, marginTop: 6 }}>you wrote: {answer.trim() || "(blank)"}</div>
+          </div>
+          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+            <button style={{ ...S.btn("ghost"), borderColor: C.danger, color: C.danger, flex: 1 }} onClick={() => record("incorrect", "")}>I was wrong</button>
+            <button style={{ ...S.btn("primary"), flex: 1 }} onClick={() => record("correct", "")}>I was right</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── DECK VIEW (v2: edit mode + generate more) ── */
-function DeckView({ deck, onStudy, onBack, onUpdate }) {
+function DeckView({ deck, quizHistory = [], onStudy, onQuiz, onBack, onUpdate }) {
+  const allStudied = deck.cards.length > 0 && deck.cards.every((c) => c.reviews > 0);
+  const pct = (s) => Math.round((s.score / s.total) * 100);
+  const bestQuiz = quizHistory.length ? quizHistory.reduce((a, b) => (pct(a) >= pct(b) ? a : b)) : null;
+  const latestQuiz = quizHistory.length ? quizHistory[quizHistory.length - 1] : null;
+  const missCounts = {};
+  quizHistory.forEach((s) => (s.missedFronts || []).forEach((f) => { missCounts[f] = (missCounts[f] || 0) + 1; }));
+  const weakSpots = Object.entries(missCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(null);
   const [moreNotes, setMoreNotes] = useState("");
@@ -833,12 +844,10 @@ function DeckView({ deck, onStudy, onBack, onUpdate }) {
   const generateMore = async () => {
     setErr(""); setBusy(true);
     try {
-      const { cards: fresh } = await generateCards(moreNotes, 10, draft.map((c) => c.front));
+      const fresh = await generateCards(moreNotes, 10, draft.map((c) => c.front));
       setDraft([...draft, ...fresh]);
       setMoreNotes("");
-    } catch (e) {
-      setErr(e instanceof QuotaError ? e.message : `Generation failed: ${e.message || e}. Try again.`);
-    }
+    } catch (e) { setErr(`Generation failed: ${e.message || e}. Try again.`); }
     setBusy(false);
   };
 
@@ -856,6 +865,14 @@ function DeckView({ deck, onStudy, onBack, onUpdate }) {
         <button style={S.btn("primary")} onClick={onStudy}>
           {due > 0 ? `Study ${due} due card${due === 1 ? "" : "s"}` : "Study all (nothing due)"}
         </button>
+        <button
+          style={{ ...S.btn("brass"), opacity: allStudied ? 1 : 0.5 }}
+          disabled={!allStudied}
+          title={allStudied ? "Typed recall quiz — one attempt per question" : "Study every card at least once to unlock the quiz"}
+          onClick={onQuiz}
+        >
+          {allStudied ? "Quiz mode" : "Quiz (study all cards first)"}
+        </button>
         {!editing
           ? <button style={S.btn("ghost")} onClick={startEdit}>Edit deck</button>
           : <>
@@ -864,6 +881,42 @@ function DeckView({ deck, onStudy, onBack, onUpdate }) {
             </>
         }
       </div>
+
+      {quizHistory.length > 0 && !editing && (
+        <div style={{ ...S.panel, marginTop: 22, borderTop: `4px solid ${C.brass}` }}>
+          <div style={{ ...S.label, marginBottom: 12 }}>Quiz results</div>
+          <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: 14 }}>
+            <div>
+              <div style={{ ...S.display, fontSize: 26, fontWeight: 800, lineHeight: 1 }}>{quizHistory.length}</div>
+              <div style={{ ...S.mono, fontSize: 10, color: C.inkSoft, textTransform: "uppercase", letterSpacing: "0.1em", marginTop: 4 }}>Attempts</div>
+            </div>
+            <div>
+              <div style={{ ...S.display, fontSize: 26, fontWeight: 800, lineHeight: 1, color: pct(latestQuiz) >= 70 ? C.jadeDeep : C.brass }}>{pct(latestQuiz)}%</div>
+              <div style={{ ...S.mono, fontSize: 10, color: C.inkSoft, textTransform: "uppercase", letterSpacing: "0.1em", marginTop: 4 }}>Latest</div>
+            </div>
+            <div>
+              <div style={{ ...S.display, fontSize: 26, fontWeight: 800, lineHeight: 1, color: C.jadeDeep }}>{pct(bestQuiz)}%</div>
+              <div style={{ ...S.mono, fontSize: 10, color: C.inkSoft, textTransform: "uppercase", letterSpacing: "0.1em", marginTop: 4 }}>Best</div>
+            </div>
+          </div>
+          {quizHistory.slice(-5).reverse().map((s, i) => (
+            <div key={i} style={{ ...S.mono, fontSize: 12, display: "flex", justifyContent: "space-between", padding: "7px 0", borderTop: `1px solid ${C.line}` }}>
+              <span style={{ color: C.inkSoft }}>{new Date(s.date).toLocaleDateString()}</span>
+              <span style={{ color: pct(s) >= 70 ? C.jadeDeep : C.danger, fontWeight: 600 }}>{s.score}/{s.total} · {pct(s)}%</span>
+            </div>
+          ))}
+          {weakSpots.length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <div style={{ ...S.label, marginBottom: 6 }}>Most missed</div>
+              {weakSpots.map(([front, n]) => (
+                <div key={front} style={{ fontSize: 13, color: C.inkSoft, padding: "3px 0" }}>
+                  <span style={{ color: C.danger, fontWeight: 600 }}>{n}×</span> {front}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {deck.summary && !editing && (
         <div style={{ ...S.panel, marginTop: 22, borderLeft: `4px solid ${C.brass}` }}>
@@ -931,7 +984,6 @@ export default function App() {
   const [data, setData] = useState(null);
   const [view, setView] = useState("home");
   const [activeId, setActiveId] = useState(null);
-  const [studyRun, setStudyRun] = useState(0); // bump to remount Study with a fresh queue
 
   useEffect(() => { loadDecks().then(setData); }, []);
 
@@ -950,44 +1002,6 @@ export default function App() {
 
   const active = data.decks.find((d) => d.id === activeId);
 
-  // Grades a session and writes it through. Called on finish, on restart, and on exit
-  // — exiting used to drop every card you had already graded on the floor.
-  const saveSession = ({ missed, cleared, reviews, record = true }) => {
-    if (!active || !reviews) return;
-    const now = Date.now();
-    const decks = data.decks.map((d) =>
-      d.id !== active.id ? d : {
-        ...d,
-        cards: d.cards.map((c) => {
-          if (!cleared[c.id] && !missed[c.id]) return c;
-          // Missed at any point this session → streak resets, due tomorrow.
-          if (missed[c.id]) {
-            const days = intervalFor(0);
-            return { ...c, reviews: c.reviews + 1, streak: 0, interval: days, due: now + days * DAY };
-          }
-          // Cleared. Only advance the ladder if the card was actually due — otherwise
-          // re-studying a deck for extra practice would march cards 1d → 3d → 7d in a
-          // single sitting and bury them for weeks.
-          if (!isDue(c)) return { ...c, reviews: c.reviews + 1 };
-          const streak = c.streak + 1;
-          const days = intervalFor(streak);
-          return { ...c, reviews: c.reviews + 1, streak, interval: days, due: now + days * DAY };
-        }),
-      }
-    );
-    // Opted out: keep the spaced-repetition progress, skip the history row so a quick
-    // re-skim doesn't pad the ledger or inflate the Reviews stat.
-    const sessions = record
-      ? [...data.sessions, {
-          date: now,
-          deckTitle: active.title,
-          reviewed: reviews,
-          cleared: Object.keys(cleared).length,
-        }]
-      : data.sessions;
-    persist({ ...data, decks, sessions });
-  };
-
   return (
     <div style={S.app}>
       <style>{FONTS}</style>
@@ -1000,8 +1014,6 @@ export default function App() {
             onNew={() => setView("create")}
             onOpen={(id) => { setActiveId(id); setView("deck"); }}
             onDelete={(id) => persist({ ...data, decks: data.decks.filter((d) => d.id !== id) })}
-            onDeleteSession={(i) => persist({ ...data, sessions: data.sessions.filter((_, n) => n !== i) })}
-            onClearSessions={() => persist({ ...data, sessions: [] })}
           />
         )}
 
@@ -1015,20 +1027,61 @@ export default function App() {
         {view === "deck" && active && (
           <DeckView
             deck={active}
+            quizHistory={data.sessions.filter((s) => s.quiz && (s.deckId === active.id || (!s.deckId && s.deckTitle === active.title)))}
             onStudy={() => setView("study")}
+            onQuiz={() => setView("quiz")}
             onBack={() => setView("home")}
             onUpdate={(updated) => persist({ ...data, decks: data.decks.map((d) => (d.id === updated.id ? updated : d)) })}
           />
         )}
 
+        {view === "quiz" && active && (
+          <Quiz
+            deck={active}
+            onExit={() => setView("deck")}
+            onFinish={(results) => {
+              const score = results.filter((r) => r.verdict === "correct").length;
+              const missedFronts = results.filter((r) => r.verdict !== "correct").map((r) => r.front);
+              const sessions = [...data.sessions, { date: Date.now(), deckId: active.id, deckTitle: active.title, quiz: true, score, total: results.length, missedFronts }];
+              persist({ ...data, sessions });
+              setView("deck");
+            }}
+          />
+        )}
+
         {view === "study" && active && (
           <Study
-            // Remounting on restart is what resets the queue, index and grading state.
-            key={`${active.id}-${studyRun}`}
             deck={active}
-            onExit={(payload) => { if (payload) saveSession(payload); setView("deck"); }}
-            onFinish={(payload) => { saveSession(payload); setView("deck"); }}
-            onRestart={(payload) => { saveSession(payload); setStudyRun((n) => n + 1); }}
+            onExit={() => setView("deck")}
+            onFinish={({ missed, cleared, reviews }) => {
+              const now = Date.now();
+              const decks = data.decks.map((d) =>
+                d.id !== active.id ? d : {
+                  ...d,
+                  cards: d.cards.map((c) => {
+                    if (!cleared[c.id] && !missed[c.id]) return c;
+                    // Missed at any point this session → streak resets, due tomorrow
+                    const newStreak = missed[c.id] ? 0 : c.streak + 1;
+                    const days = intervalFor(newStreak);
+                    return {
+                      ...c,
+                      reviews: c.reviews + 1,
+                      streak: newStreak,
+                      interval: days,
+                      due: now + days * DAY,
+                    };
+                  }),
+                }
+              );
+              const sessions = [...data.sessions, {
+                date: now,
+                deckTitle: active.title,
+                reviewed: reviews,
+                cleared: Object.keys(cleared).length,
+              }];
+              persist({ ...data, decks, sessions });
+              setView("deck");
+            }}
           />
         )}
       </div>
