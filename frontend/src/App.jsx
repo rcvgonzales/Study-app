@@ -312,9 +312,48 @@ function Home({ data, onNew, onOpen, onDelete, onDeleteSession, onClearSessions 
       </div>
 
       {data.sessions.length > 0 && (() => {
-        // Newest first. The row's position here is NOT its index in data.sessions —
-        // deleting by this index would remove the wrong entry, so map back to the real one.
-        const rows = data.sessions.slice(-6).reverse();
+        // Split the ledger by type. A row's position in these filtered lists is NOT its
+        // index in data.sessions — deleting by that would remove the wrong entry, so each
+        // row carries its real index (i) for onDeleteSession.
+        const withIdx = data.sessions.map((s, i) => ({ s, i }));
+        const studyAll = withIdx.filter(({ s }) => !s.quiz);
+        const quizAll = withIdx.filter(({ s }) => s.quiz);
+
+        // One labeled sub-section, newest first. Hidden entirely when empty. renderMeta
+        // draws the type-specific right-hand cell; the row chrome + delete stays shared.
+        const section = (title, all, renderMeta) => {
+          if (all.length === 0) return null;
+          const rows = all.slice(-6).reverse();
+          return (
+            <div style={{ marginTop: 18 }}>
+              <div style={{ ...S.label, marginBottom: 8 }}>{title}</div>
+              <div style={{ ...S.panel, padding: 0, overflow: "hidden" }}>
+                {rows.map(({ s, i }, n) => (
+                  <div key={i} style={{ ...S.mono, fontSize: 12, padding: "10px 16px", borderBottom: n < rows.length - 1 ? `1px solid ${C.line}` : "none", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <span>{new Date(s.date).toLocaleDateString()} · {s.deckTitle}</span>
+                    <span style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      {renderMeta(s)}
+                      <button
+                        aria-label={`Remove ${s.deckTitle} entry`}
+                        title="Remove this entry"
+                        onClick={() => onDeleteSession(i)}
+                        style={{ ...S.mono, fontSize: 15, lineHeight: 1, color: C.inkSoft, background: "none", border: "none", cursor: "pointer", padding: "2px 4px" }}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  </div>
+                ))}
+              </div>
+              {all.length > rows.length && (
+                <div style={{ ...S.mono, fontSize: 11, color: C.inkSoft, marginTop: 6 }}>
+                  showing the {rows.length} most recent of {all.length}
+                </div>
+              )}
+            </div>
+          );
+        };
+
         return (
           <div style={{ marginTop: 32 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
@@ -333,32 +372,15 @@ function Home({ data, onNew, onOpen, onDelete, onDeleteSession, onClearSessions 
                 <button style={S.btn("ghost")} onClick={() => setConfirmClear(true)}>Clear ledger</button>
               )}
             </div>
-            <div style={{ ...S.panel, padding: 0, overflow: "hidden" }}>
-              {rows.map((s, i) => {
-                const realIdx = data.sessions.length - 1 - i;
-                return (
-                  <div key={realIdx} style={{ ...S.mono, fontSize: 12, padding: "10px 16px", borderBottom: i < rows.length - 1 ? `1px solid ${C.line}` : "none", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                    <span>{new Date(s.date).toLocaleDateString()} · {s.deckTitle}</span>
-                    <span style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                      <span style={{ color: C.jadeDeep }}>{s.reviewed} reviews · {s.cleared} cleared</span>
-                      <button
-                        aria-label={`Remove ${s.deckTitle} entry`}
-                        title="Remove this entry"
-                        onClick={() => onDeleteSession(realIdx)}
-                        style={{ ...S.mono, fontSize: 15, lineHeight: 1, color: C.inkSoft, background: "none", border: "none", cursor: "pointer", padding: "2px 4px" }}
-                      >
-                        ×
-                      </button>
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-            {data.sessions.length > rows.length && (
-              <div style={{ ...S.mono, fontSize: 11, color: C.inkSoft, marginTop: 6 }}>
-                showing the {rows.length} most recent of {data.sessions.length}
-              </div>
-            )}
+            {section("Reviewed", studyAll, (s) => (
+              <span style={{ color: C.jadeDeep }}>{s.reviewed} reviews · {s.cleared} cleared</span>
+            ))}
+            {section("Quiz results", quizAll, (s) => {
+              const percent = s.total ? Math.round((s.score / s.total) * 100) : 0;
+              return (
+                <span style={{ color: percent >= 70 ? C.jadeDeep : C.danger }}>{s.score}/{s.total} · {percent}%</span>
+              );
+            })}
           </div>
         );
       })()}
